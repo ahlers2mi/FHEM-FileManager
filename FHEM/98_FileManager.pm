@@ -1,8 +1,9 @@
 # $Id: 98_FileManager.pm
-# Version: 1.4.0
+# Version: 1.5.0
 # FHEM-Modul: Browser-basierter Dateimanager (Upload & Download über FHEMWEB)
 #
 # Changelog:
+#   1.5.0 - Feature: Ordner anlegen und in Unterverzeichnisse navigieren
 #   1.4.0 - Fix: POST-Body steckt in $arg, Methode aus Request-Line ermitteln
 #   1.3.0 - Debug-Version
 #   1.2.0 - Fix: FHEMWEB speichert Upload in FORM{file} + FORM{"file.name"}
@@ -25,7 +26,7 @@ use POSIX      qw(strftime);
 use vars qw($FW_ME $FW_CSRF $FW_wname $FW_chash);
 use vars qw(%FW_webArgs @FW_httpheader %FW_httpheader);
 
-my $FileManager_Version = '1.4.0';
+my $FileManager_Version = '1.5.0';
 
 # ------------------------------------------------------------------
 sub FileManager_toUTF8 {
@@ -34,6 +35,16 @@ sub FileManager_toUTF8 {
     return $str if utf8::is_utf8($str);
     my $dec = eval { decode('utf-8', $str, Encode::FB_CROAK) };
     return $@ ? decode('latin-1', $str) : $dec;
+}
+
+# ------------------------------------------------------------------
+# Bereinigt einen relativen Pfad – verhindert Path-Traversal
+# ------------------------------------------------------------------
+sub FileManager_SanitizePath {
+    my ($p) = @_;
+    return '' unless defined $p && $p ne '';
+    my @parts = grep { $_ ne '' && $_ ne '.' && $_ ne '..' } split m{/}, $p;
+    return join('/', @parts);
 }
 
 # ------------------------------------------------------------------
@@ -111,9 +122,36 @@ sub FileManager_Get {
 }
 
 # ------------------------------------------------------------------
+# Hilfsfunktion: URL-kodiert einen Pfad (Segmente einzeln kodieren)
+# ------------------------------------------------------------------
+sub FileManager_EncodeURIPath {
+    my ($path) = @_;
+    my @segs = map {
+        my $s = $_;
+        $s =~ s/([^A-Za-z0-9\-_.~])/sprintf('%%%02X', ord($1))/ge;
+        $s;
+    } split m{/}, $path;
+    return join('/', @segs);
+}
+
+# ------------------------------------------------------------------
+# Parst einen application/x-www-form-urlencoded Body
+# ------------------------------------------------------------------
+sub FileManager_ParseFormBody {
+    my ($body) = @_;
+    my %p;
+    for my $pair (split /[&;]/, $body) {
+        my ($k, $v) = split /=/, $pair, 2;
+        next unless defined $k && $k ne '';
+        $v //= '';
+        for ($k, $v) { s/\+/ /g; s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge; }
+        $p{$k} = $v;
+    }
+    return %p;
+}
+
+# ------------------------------------------------------------------
 # FHEMWEB übergibt: $arg = URL-Pfad + \n + POST-Body (alles zusammen)
-# Die HTTP-Methode steht als Key in %FW_httpheader z.B.:
-#   "POST /fhem/FileManager/myFM HTTP/1.1" => ""
 # ------------------------------------------------------------------
 sub FileManager_WebHandler {
     my ($arg) = @_;
@@ -153,19 +191,32 @@ sub FileManager_WebHandler {
     return ('text/plain; charset=utf-8', 'Modul deaktiviert')
         if IsDisabled($devName);
 
+    # ---- Aktueller Unterpfad aus Query-String (%FW_webArgs) -------
+    my $subPath = FileManager_SanitizePath($FW_webArgs{path} // '');
+
     # ---- DOWNLOAD --------------------------------------------------
     if ($urlPart =~ m{/download/(.+)$}) {
         return FileManager_HandleDownload($hash, $devName, $dir, $1);
     }
 
-    # ---- UPLOAD (POST) --------------------------------------------
+    # ---- POST: Ordner anlegen oder Upload --------------------------
     if ($method eq 'POST') {
-        return FileManager_HandleUpload($hash, $devName, $dir, $arg);
+        my $ct = '';
+        for my $hk (keys %FW_httpheader) {
+            if (lc($hk) eq 'content-type') { $ct = $FW_httpheader{$hk}; last; }
+        }
+
+        if ($ct =~ /multipart\/form-data/i) {
+            return FileManager_HandleUpload($hash, $devName, $dir, $arg, $subPath);
+        } else {
+            # application/x-www-form-urlencoded → Ordner anlegen
+            return FileManager_HandleMkdir($hash, $devName, $dir, $postBody, $subPath);
+        }
     }
 
     # ---- Hauptseite (GET) -----------------------------------------
     return ('text/html; charset=utf-8',
-            FileManager_RenderPage($hash, $devName, $dir));
+            FileManager_RenderPage($hash, $devName, $dir, $subPath));
 }
 
 # ------------------------------------------------------------------
@@ -173,10 +224,11 @@ sub FileManager_HandleDownload {
     my ($hash, $name, $dir, $rawFile) = @_;
 
     $rawFile =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge;
-    my $file     = FileManager_toUTF8(basename($rawFile));
-    my $fullPath = "$dir/$file";
+    # Sicherstellen dass kein Path-Traversal möglich ist
+    my $safeRel = FileManager_SanitizePath($rawFile);
+    my $fullPath = "$dir/$safeRel";
 
-    return ('text/plain; charset=utf-8', "Datei nicht gefunden: $file")
+    return ('text/plain; charset=utf-8', "Datei nicht gefunden: $safeRel")
         unless -f $fullPath;
 
     open(my $fh, '<:raw', $fullPath)
@@ -185,7 +237,8 @@ sub FileManager_HandleDownload {
     my $content = <$fh>;
     close $fh;
 
-    my $ext = lc($file =~ /\.([^.]+)$/ ? $1 : '');
+    my $fileName = basename($safeRel);
+    my $ext = lc($fileName =~ /\.([^.]+)$/ ? $1 : '');
     my %mimes = (
         jpg  => 'image/jpeg', jpeg => 'image/jpeg', png  => 'image/png',
         gif  => 'image/gif',  pdf  => 'application/pdf',
@@ -197,31 +250,62 @@ sub FileManager_HandleDownload {
     if ($FW_chash) {
         $FW_chash->{extraHeaders} //= '';
         $FW_chash->{extraHeaders} .=
-            "Content-Disposition: attachment; filename=\"$file\"\r\n";
+            "Content-Disposition: attachment; filename=\"$fileName\"\r\n";
     }
 
     readingsBeginUpdate($hash);
-    readingsBulkUpdate($hash, 'lastDownloadFile', $file);
+    readingsBulkUpdate($hash, 'lastDownloadFile', $safeRel);
     readingsBulkUpdate($hash, 'lastDownloadTime',
                        strftime('%Y-%m-%d %H:%M:%S', localtime));
     readingsEndUpdate($hash, 1);
 
-    Log3($name, 3, "FileManager ($name): Download: $file");
+    Log3($name, 3, "FileManager ($name): Download: $safeRel");
     return ($mime, $content);
 }
 
 # ------------------------------------------------------------------
-# POST-Body steckt komplett in $arg (URL + \n + Body zusammen)
+# Ordner anlegen (application/x-www-form-urlencoded POST)
+# ------------------------------------------------------------------
+sub FileManager_HandleMkdir {
+    my ($hash, $name, $dir, $postBody, $subPath) = @_;
+
+    my %form = FileManager_ParseFormBody($postBody);
+    my $subPathForm = FileManager_SanitizePath($form{path} // $subPath);
+    my $dirName     = FileManager_SanitizePath($form{dirname} // '');
+
+    my $currentDir = $subPathForm ? "$dir/$subPathForm" : $dir;
+
+    unless ($dirName && $dirName !~ m{/}) {
+        return ('text/html; charset=utf-8',
+                FileManager_RenderPage($hash, $name, $dir, $subPathForm,
+                    'Ungültiger Ordnername.'));
+    }
+
+    my $newDir = "$currentDir/$dirName";
+    if (-d $newDir) {
+        return ('text/html; charset=utf-8',
+                FileManager_RenderPage($hash, $name, $dir, $subPathForm,
+                    "Ordner '$dirName' existiert bereits."));
+    }
+
+    make_path($newDir)
+        or return ('text/html; charset=utf-8',
+                   FileManager_RenderPage($hash, $name, $dir, $subPathForm,
+                       "Ordner konnte nicht erstellt werden: $!"));
+
+    Log3($name, 3, "FileManager ($name): Ordner erstellt: $newDir");
+    return ('text/html; charset=utf-8',
+            FileManager_RenderPage($hash, $name, $dir, $subPathForm,
+                undef, "&#10003; Ordner '$dirName' erstellt."));
+}
+
 # ------------------------------------------------------------------
 sub FileManager_HandleUpload {
-    my ($hash, $name, $dir, $arg) = @_;
+    my ($hash, $name, $dir, $arg, $subPath) = @_;
 
     my $ct = '';
     for my $hk (keys %FW_httpheader) {
-        if (lc($hk) eq 'content-type') {
-            $ct = $FW_httpheader{$hk};
-            last;
-        }
+        if (lc($hk) eq 'content-type') { $ct = $FW_httpheader{$hk}; last; }
     }
 
     my ($boundary) = $ct =~ /boundary=["']?([^"';\s\r\n]+)/i;
@@ -229,33 +313,43 @@ sub FileManager_HandleUpload {
     unless ($boundary) {
         Log3($name, 2, "FileManager ($name): Kein Boundary in Content-Type: '$ct'");
         return ('text/html; charset=utf-8',
-                FileManager_RenderPage($hash, $name, $dir,
+                FileManager_RenderPage($hash, $name, $dir, $subPath,
                     "Upload-Fehler: Kein Multipart-Boundary gefunden."));
     }
 
-    Log3($name, 3, "FileManager ($name): Upload boundary='$boundary'");
+    my ($fileName, $fileData, $pathField) = FileManager_ParseMultipart($arg, $boundary);
+    # Pfad aus Formfeld hat Vorrang vor Query-String
+    $subPath = FileManager_SanitizePath($pathField) if defined $pathField && $pathField ne '';
 
-    my ($fileName, $fileData) = FileManager_ParseMultipart($arg, $boundary);
+    my $currentDir = $subPath ? "$dir/$subPath" : $dir;
 
     unless (defined $fileName && $fileName ne '' && defined $fileData && length($fileData) > 0) {
-        Log3($name, 2, "FileManager ($name): Multipart-Parse lieferte nichts. "
-            . "fileName='" . ($fileName // 'undef') . "' "
-            . "dataLen=" . length($fileData // ''));
+        Log3($name, 2, "FileManager ($name): Multipart-Parse lieferte nichts.");
         return ('text/html; charset=utf-8',
-                FileManager_RenderPage($hash, $name, $dir,
+                FileManager_RenderPage($hash, $name, $dir, $subPath,
                     'Upload-Fehler: Datei konnte nicht gelesen werden.'));
     }
 
-    return FileManager_SaveFile($hash, $name, $dir, $fileName, $fileData);
+    return FileManager_SaveFile($hash, $name, $dir, $currentDir, $subPath, $fileName, $fileData);
 }
 
 # ------------------------------------------------------------------
 sub FileManager_ParseMultipart {
     my ($body, $boundary) = @_;
-    my ($fileName, $fileData) = ('', undef);
+    my ($fileName, $fileData, $pathField) = ('', undef, '');
 
     my @parts = split(/--\Q$boundary\E/, $body);
     for my $part (@parts) {
+        # Pfad-Formfeld (kein filename)
+        if ($part =~ /name="path"/i && $part !~ /filename=/i) {
+            if ($part =~ /\r\n\r\n(.*)/s) {
+                $pathField = $1;
+                $pathField =~ s/\r?\n.*//s;
+                $pathField =~ s/\s+$//;
+            }
+            next;
+        }
+
         next unless $part =~ /filename="([^"]+)"/i;
         $fileName = $1;
 
@@ -272,12 +366,12 @@ sub FileManager_ParseMultipart {
         }
         last;
     }
-    return ($fileName, $fileData);
+    return ($fileName, $fileData, $pathField);
 }
 
 # ------------------------------------------------------------------
 sub FileManager_SaveFile {
-    my ($hash, $name, $dir, $fileName, $fileData) = @_;
+    my ($hash, $name, $dir, $currentDir, $subPath, $fileName, $fileData) = @_;
 
     $fileName = FileManager_toUTF8(basename($fileName));
     $fileName =~ s/[^\w\s.\-äöüÄÖÜß]/_/g;
@@ -288,68 +382,122 @@ sub FileManager_SaveFile {
         my @exts = split /,/, $allowed;
         unless (grep { lc($_) eq $ext } @exts) {
             return ('text/html; charset=utf-8',
-                    FileManager_RenderPage($hash, $name, $dir,
+                    FileManager_RenderPage($hash, $name, $dir, $subPath,
                         "Dateiendung '$ext' nicht erlaubt."));
         }
     }
 
-    my $targetPath = "$dir/$fileName";
+    make_path($currentDir) unless -d $currentDir;
+
+    my $targetPath = "$currentDir/$fileName";
     open(my $fh, '>:raw', $targetPath)
         or return ('text/html; charset=utf-8',
-                   FileManager_RenderPage($hash, $name, $dir,
+                   FileManager_RenderPage($hash, $name, $dir, $subPath,
                        "Schreibfehler: $!"));
     print $fh $fileData;
     close $fh;
 
     my $size = -s $targetPath;
+    my $displayPath = $subPath ? "$subPath/$fileName" : $fileName;
 
     readingsBeginUpdate($hash);
-    readingsBulkUpdate($hash, 'lastUploadFile', $fileName);
+    readingsBulkUpdate($hash, 'lastUploadFile', $displayPath);
     readingsBulkUpdate($hash, 'lastUploadTime',
                        strftime('%Y-%m-%d %H:%M:%S', localtime));
     readingsBulkUpdate($hash, 'lastUploadSize', "$size Bytes");
     readingsEndUpdate($hash, 1);
 
-    Log3($name, 3, "FileManager ($name): Upload OK: $fileName ($size Bytes)");
+    Log3($name, 3, "FileManager ($name): Upload OK: $displayPath ($size Bytes)");
 
     return ('text/html; charset=utf-8',
-            FileManager_RenderPage($hash, $name, $dir,
+            FileManager_RenderPage($hash, $name, $dir, $subPath,
                 undef, "&#10003; '$fileName' hochgeladen ($size Bytes)."));
 }
 
 # ------------------------------------------------------------------
 sub FileManager_RenderPage {
-    my ($hash, $name, $dir, $error, $success) = @_;
+    my ($hash, $name, $dir, $subPath, $error, $success) = @_;
+    $subPath //= '';
 
-    opendir(my $dh, $dir) or return "<html><body>Fehler: $!</body></html>";
-    my @files = sort grep { !/^\./ && -f "$dir/$_" } readdir($dh);
+    my $currentDir = $subPath ? "$dir/$subPath" : $dir;
+
+    opendir(my $dh, $currentDir)
+        or return "<html><body>Verzeichnis nicht gefunden: $currentDir</body></html>";
+    my @entries = sort grep { !/^\./ } readdir($dh);
     closedir $dh;
+
+    my @dirs  = grep { -d "$currentDir/$_" } @entries;
+    my @files = grep { -f "$currentDir/$_" } @entries;
 
     my $me      = $FW_ME // '/fhem';
     my $baseUrl = "$me/FileManager/$name";
 
     my $csrfInput = '';
+    my $csrfQuery = '';
     if ($FW_wname && $defs{$FW_wname} && $defs{$FW_wname}{CSRFTOKEN}) {
         my $token = $defs{$FW_wname}{CSRFTOKEN};
         $csrfInput = qq{<input type="hidden" name="fwcsrf" value="$token">};
+        $csrfQuery = "fwcsrf=$token&";
     }
 
-    my $rows = '';
-    if (@files) {
-        for my $f (@files) {
-            my $fUtf    = FileManager_toUTF8($f);
-            my $size    = -s "$dir/$f";
-            my $mtime   = strftime('%Y-%m-%d %H:%M',
-                              localtime((stat("$dir/$f"))[9]));
-            my $sizeStr = $size >= 1_048_576
-                ? sprintf('%.1f MB', $size / 1_048_576)
-                : $size >= 1_024
-                ? sprintf('%.1f KB', $size / 1_024)
-                : "$size B";
-            my $encF = $fUtf;
-            $encF =~ s/([^A-Za-z0-9\-_.])/sprintf('%%%02X', ord($1))/ge;
+    # ---- Breadcrumb -----------------------------------------------
+    my $breadcrumb = qq{<a href="$baseUrl">&#127968; $name</a>};
+    if ($subPath) {
+        my @segs  = split m{/}, $subPath;
+        my $built = '';
+        for my $seg (@segs) {
+            $built = $built ? "$built/$seg" : $seg;
+            my $encBuilt = FileManager_EncodeURIPath($built);
+            $breadcrumb .= qq{ &rsaquo; <a href="$baseUrl?${csrfQuery}path=$encBuilt">$seg</a>};
+        }
+    }
 
-            $rows .= <<"END_ROW";
+    # ---- "Hoch"-Link ----------------------------------------------
+    my $upLink = '';
+    if ($subPath) {
+        my $parentPath = $subPath =~ m{^(.+)/[^/]+$} ? $1 : '';
+        my $encParent  = FileManager_EncodeURIPath($parentPath);
+        my $upHref     = $parentPath
+            ? "$baseUrl?${csrfQuery}path=$encParent"
+            : $baseUrl;
+        $upLink = qq{<a class="fm-up" href="$upHref">&#8593; Eine Ebene höher</a>};
+    }
+
+    # ---- Verzeichnis-Zeilen ---------------------------------------
+    my $rows = '';
+    for my $d (@dirs) {
+        my $dUtf  = FileManager_toUTF8($d);
+        my $relPath = $subPath ? "$subPath/$d" : $d;
+        my $encP  = FileManager_EncodeURIPath($relPath);
+        my $mtime = strftime('%Y-%m-%d %H:%M',
+                        localtime((stat("$currentDir/$d"))[9]));
+        $rows .= <<"END_ROW";
+<tr class="fm-dir-row">
+  <td class="fm-name">
+    <a class="fm-dir-link" href="$baseUrl?${csrfQuery}path=$encP">&#128193; $dUtf</a>
+  </td>
+  <td class="fm-size" style="color:#aaa">&mdash;</td>
+  <td class="fm-date">$mtime</td>
+  <td class="fm-action"></td>
+</tr>
+END_ROW
+    }
+
+    # ---- Datei-Zeilen ---------------------------------------------
+    for my $f (@files) {
+        my $fUtf    = FileManager_toUTF8($f);
+        my $relFile = $subPath ? "$subPath/$f" : $f;
+        my $encF    = FileManager_EncodeURIPath($relFile);
+        my $size    = -s "$currentDir/$f";
+        my $mtime   = strftime('%Y-%m-%d %H:%M',
+                          localtime((stat("$currentDir/$f"))[9]));
+        my $sizeStr = $size >= 1_048_576
+            ? sprintf('%.1f MB', $size / 1_048_576)
+            : $size >= 1_024
+            ? sprintf('%.1f KB', $size / 1_024)
+            : "$size B";
+
+        $rows .= <<"END_ROW";
 <tr>
   <td class="fm-name">$fUtf</td>
   <td class="fm-size">$sizeStr</td>
@@ -359,14 +507,18 @@ sub FileManager_RenderPage {
   </td>
 </tr>
 END_ROW
-        }
-    } else {
-        $rows = '<tr><td colspan="4" class="fm-empty">Keine Dateien vorhanden.</td></tr>';
+    }
+
+    unless (@dirs || @files) {
+        $rows = '<tr><td colspan="4" class="fm-empty">Keine Einträge vorhanden.</td></tr>';
     }
 
     my $msgBox = '';
     $msgBox .= qq{<div class="fm-error">$error</div>}     if $error;
     $msgBox .= qq{<div class="fm-success">$success</div>} if $success;
+
+    my $encSubPath = FileManager_EncodeURIPath($subPath);
+    my $pathInput  = qq{<input type="hidden" name="path" value="$subPath">};
 
     return <<"END_HTML";
 <!DOCTYPE html>
@@ -374,64 +526,97 @@ END_ROW
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FileManager &#8211; $name</title>
+  <title>FileManager &ndash; $name</title>
   <style>
-    body        { font-family: Arial, sans-serif; margin: 20px;
-                  background: #f5f5f5; color: #333; }
-    h2          { color: #2c5f8a; border-bottom: 2px solid #2c5f8a;
-                  padding-bottom: 6px; }
-    .fm-ver     { color: #aaa; font-size: 0.78em; margin-left: 8px;
-                  font-weight: normal; vertical-align: middle; }
-    .fm-upload  { background: #fff; border: 1px solid #ccc; border-radius: 6px;
-                  padding: 16px 20px; margin-bottom: 24px; }
-    .fm-upload h3 { margin-top: 0; color: #555; }
-    .fm-upload button { background: #2c5f8a; color: #fff; border: none;
-                        padding: 6px 16px; border-radius: 4px; cursor: pointer; }
-    .fm-upload button:hover { background: #1e4468; }
-    table       { width: 100%; border-collapse: collapse; background: #fff;
-                  border: 1px solid #ccc; border-radius: 6px; overflow: hidden; }
-    th          { background: #2c5f8a; color: #fff; padding: 10px 14px;
-                  text-align: left; }
-    td          { padding: 8px 14px; border-bottom: 1px solid #eee; }
+    body          { font-family: Arial, sans-serif; margin: 20px;
+                    background: #f5f5f5; color: #333; }
+    h2            { color: #2c5f8a; border-bottom: 2px solid #2c5f8a;
+                    padding-bottom: 6px; }
+    .fm-ver       { color: #aaa; font-size: 0.78em; margin-left: 8px;
+                    font-weight: normal; vertical-align: middle; }
+    .fm-breadcrumb{ font-size: 0.95em; margin-bottom: 14px; }
+    .fm-breadcrumb a { color: #2c5f8a; text-decoration: none; }
+    .fm-breadcrumb a:hover { text-decoration: underline; }
+    .fm-up        { display: inline-block; margin-bottom: 12px; color: #2c5f8a;
+                    text-decoration: none; font-size: 0.9em; }
+    .fm-up:hover  { text-decoration: underline; }
+    .fm-panels    { display: flex; gap: 16px; margin-bottom: 24px;
+                    flex-wrap: wrap; }
+    .fm-panel     { background: #fff; border: 1px solid #ccc; border-radius: 6px;
+                    padding: 16px 20px; flex: 1; min-width: 220px; }
+    .fm-panel h3  { margin-top: 0; color: #555; font-size: 1em; }
+    .fm-panel input[type=file]   { display: block; margin-bottom: 8px; }
+    .fm-panel input[type=text]   { padding: 5px 8px; border: 1px solid #ccc;
+                                   border-radius: 4px; width: calc(100% - 90px);
+                                   font-size: 0.9em; }
+    .fm-panel button { background: #2c5f8a; color: #fff; border: none;
+                       padding: 6px 16px; border-radius: 4px; cursor: pointer;
+                       font-size: 0.9em; }
+    .fm-panel button:hover { background: #1e4468; }
+    table         { width: 100%; border-collapse: collapse; background: #fff;
+                    border: 1px solid #ccc; border-radius: 6px; overflow: hidden; }
+    th            { background: #2c5f8a; color: #fff; padding: 10px 14px;
+                    text-align: left; }
+    td            { padding: 8px 14px; border-bottom: 1px solid #eee; }
     tr:last-child td { border-bottom: none; }
-    tr:hover td { background: #f0f7ff; }
-    .fm-name    { font-weight: bold; }
-    .fm-size    { color: #777; font-size: 0.9em; }
-    .fm-date    { color: #999; font-size: 0.85em; }
-    .fm-btn     { text-decoration: none; padding: 4px 10px; border-radius: 4px;
-                  font-size: 0.85em; display: inline-block; }
-    .fm-dl      { background: #e8f4ea; color: #2a7a2a; border: 1px solid #aad4aa; }
-    .fm-dl:hover { background: #c8e8ca; }
-    .fm-empty   { text-align: center; color: #aaa; padding: 20px; }
-    .fm-error   { background: #fde; border: 1px solid #f88; border-radius: 4px;
-                  padding: 10px 16px; margin-bottom: 16px; color: #900; }
-    .fm-success { background: #dfd; border: 1px solid #8c8; border-radius: 4px;
-                  padding: 10px 16px; margin-bottom: 16px; color: #060; }
-    code        { background: #eee; padding: 1px 5px; border-radius: 3px;
-                  font-size: 0.9em; }
+    tr:hover td   { background: #f0f7ff; }
+    .fm-dir-row td { background: #fafbff; }
+    .fm-dir-row:hover td { background: #edf3ff; }
+    .fm-dir-link  { color: #2c5f8a; text-decoration: none; font-weight: bold; }
+    .fm-dir-link:hover { text-decoration: underline; }
+    .fm-name      { font-weight: bold; }
+    .fm-size      { color: #777; font-size: 0.9em; }
+    .fm-date      { color: #999; font-size: 0.85em; }
+    .fm-btn       { text-decoration: none; padding: 4px 10px; border-radius: 4px;
+                    font-size: 0.85em; display: inline-block; }
+    .fm-dl        { background: #e8f4ea; color: #2a7a2a; border: 1px solid #aad4aa; }
+    .fm-dl:hover  { background: #c8e8ca; }
+    .fm-empty     { text-align: center; color: #aaa; padding: 20px; }
+    .fm-error     { background: #fde; border: 1px solid #f88; border-radius: 4px;
+                    padding: 10px 16px; margin-bottom: 16px; color: #900; }
+    .fm-success   { background: #dfd; border: 1px solid #8c8; border-radius: 4px;
+                    padding: 10px 16px; margin-bottom: 16px; color: #060; }
+    code          { background: #eee; padding: 1px 5px; border-radius: 3px;
+                    font-size: 0.9em; }
   </style>
 </head>
 <body>
-  <h2>&#128193; FileManager &#8211; $name
+  <h2>&#128193; FileManager &ndash; $name
     <span class="fm-ver">v$FileManager_Version</span>
   </h2>
-  <p style="color:#777;font-size:0.9em">Verzeichnis: <code>$dir</code></p>
+  <p style="color:#777;font-size:0.9em">Wurzel: <code>$dir</code></p>
+
+  <div class="fm-breadcrumb">$breadcrumb</div>
+  $upLink
 
   $msgBox
 
-  <div class="fm-upload">
-    <h3>&#8593; Datei hochladen</h3>
-    <form method="POST" action="$baseUrl" enctype="multipart/form-data">
-      $csrfInput
-      <input type="file" name="file" required>
-      <button type="submit">Hochladen</button>
-    </form>
+  <div class="fm-panels">
+    <div class="fm-panel">
+      <h3>&#8593; Datei hochladen</h3>
+      <form method="POST" action="$baseUrl" enctype="multipart/form-data">
+        $csrfInput
+        $pathInput
+        <input type="file" name="file" required>
+        <button type="submit">Hochladen</button>
+      </form>
+    </div>
+    <div class="fm-panel">
+      <h3>&#128193; Neuen Ordner anlegen</h3>
+      <form method="POST" action="$baseUrl">
+        $csrfInput
+        $pathInput
+        <input type="hidden" name="action" value="mkdir">
+        <input type="text" name="dirname" placeholder="Ordnername" required>
+        <button type="submit">Erstellen</button>
+      </form>
+    </div>
   </div>
 
   <table>
     <thead>
       <tr>
-        <th>Dateiname</th>
+        <th>Name</th>
         <th>Gr&ouml;&szlig;e</th>
         <th>Ge&auml;ndert</th>
         <th>Aktion</th>
@@ -450,8 +635,8 @@ END_HTML
 
 =pod
 =item device
-=item summary    Browser-based file manager for FHEM (upload & download via web UI)
-=item summary_DE Browser-Dateimanager: Dateien per Webbrowser hoch- und runterladen
+=item summary    Browser-based file manager for FHEM (upload, download, folders)
+=item summary_DE Browser-Dateimanager: Dateien und Ordner per Webbrowser verwalten
 
 =begin html
 
